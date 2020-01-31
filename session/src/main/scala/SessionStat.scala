@@ -1,10 +1,10 @@
 import java.util.{Date, UUID}
 
+import net.sf.json.JSONObject
 import commons.conf.ConfigurationManager
 import commons.constant.Constants
 import commons.model.UserVisitAction
 import commons.utils.{DateUtils, ParamUtils, StringUtils}
-import net.sf.json.JSONObject
 import org.apache.spark.SparkConf
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
