@@ -10,7 +10,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{SaveMode, SparkSession}
 
 import scala.collection.mutable
-import scala.collection.mutable.ListBuffer
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 
 object SessionStat {
 
@@ -37,6 +37,7 @@ object SessionStat {
     // sessionId2FilterRDD: RDD[(sessionId, fullInfo)] 是所有符合过滤条件的数据组成的RDD
     // getSessionFilteredRDD: 实现根据限制条件对session数据进行过滤，并完成累加器的更新
     val sessionId2FilterRDD = getSessionFilteredRDD(taskParam, sessionId2FullInfoRDD, sessionStatisticAccumulator)
+
     /*
     不加上这一句相当与没有action算子，数据库中的数据不准确
      */
@@ -52,36 +53,37 @@ object SessionStat {
   }
 
 
-  def generateRandomIndexList(extractPerDay: Int, daySessionCount: Long, hourCountMap: mutable.HashMap[String, Long], hourListMap: mutable.HashMap[String, ListBuffer[Int]]) = {
+  def generateRandomIndexList(extractPerDay: Int,
+                              daySessionCount: Long,
+                              hourCountMap: mutable.HashMap[String, Long],
+                              hourListMap: mutable.HashMap[String, ListBuffer[Int]]) = {
     for ((hour, count) <- hourCountMap) {
-      var hourExtractCount = (count / daySessionCount.toDouble) * extractPerDay.toInt
+      var hourExtractCount = ((count / daySessionCount.toDouble) * extractPerDay).toInt
       // 避免一个小时要抽取的数量超过这个小时的总数 校验
       if (hourExtractCount > count) {
-        hourExtractCount = count
+        hourExtractCount = count.toInt
       }
       val random = new Random()
 
       hourListMap.get(hour) match {
         case None => hourListMap(hour) = new ListBuffer[Int]
-          for ( i <- 0 until hourExtractCount){
+          for (i <- 0 until hourExtractCount) {
             var index = random.nextInt(count.toInt)
-            while (hourListMap(hour).contains(index)){
+            while (hourListMap(hour).contains(index)) {
               index = random.nextInt(count.toInt)
             }
             hourListMap(hour).append(index)
           }
-        case Some(list) =>{
-          for ( i <- 0 until hourExtractCount){
+        case Some(list) => {
+          for (i <- 0 until hourExtractCount) {
             var index = random.nextInt(count.toInt)
-            while (hourListMap(hour).contains(index)){
+            while (hourListMap(hour).contains(index)) {
               index = random.nextInt(count.toInt)
             }
             hourListMap(hour).append(index)
           }
         }
       }
-
-
 
 
     }
@@ -135,16 +137,44 @@ object SessionStat {
       val dataHourExtractIndexListMapBd = sparkSession.sparkContext.broadcast(dateHourExtractIndexListMap)
 
       val dateHour2GroupRDD: RDD[(String, Iterable[String])] = dateHour2FullInfoRDD.groupByKey
-      dateHour2GroupRDD.flatMap{
-        case (dateHour,iterableFullInfo) =>
+      //   RDD[(dateHour, Iterable[fullInfo])]
+      // extractSessionRDD: RDD[SessionRandomExtract]
+      // 返回的是一个ArrayBuffer对象
+      val extractSessionRDD =  dateHour2GroupRDD.flatMap {
+        case (dateHour, iterableFullInfo) =>
           val date = dateHour.split("_")(0)
           val hour = dateHour.split("_")(1)
-          dataHourExtractIndexListMapBd.
-      }
+          val extractList:ListBuffer[Int] = dataHourExtractIndexListMapBd.value.get(date).get(hour)
+          // 定义一个容器
+          val extractSessionArrayBuffer = new ArrayBuffer[SessionRandomExtract]()
+          var index = 0
+          for (fullInfo <- iterableFullInfo) {
+            if (extractList.contains(index)) {
+              val sessionId = StringUtils.getFieldFromConcatString(fullInfo, "\\|", Constants.FIELD_SESSION_ID)
+              val startTime = StringUtils.getFieldFromConcatString(fullInfo, "\\|", Constants.FIELD_START_TIME)
+              val searchKeywords = StringUtils.getFieldFromConcatString(fullInfo, "\\|", Constants.FIELD_SEARCH_KEYWORDS)
+              val clickCategories = StringUtils.getFieldFromConcatString(fullInfo, "\\|", Constants.FIELD_CLICK_CATEGORY_IDS)
+              val extractSession = SessionRandomExtract(taskUUID, sessionId, startTime, searchKeywords, clickCategories)
+              extractSessionArrayBuffer += extractSession
+            }
+            index += 1
+          }
 
+          extractSessionArrayBuffer
+      }
+//      extractSessionRDD.foreach(println(_))
+      import sparkSession.implicits._
+      //随机抽取100个session；
+     /* extractSessionRDD.toDF().write
+        .format("jdbc")
+        .option("url", ConfigurationManager.config.getString(Constants.JDBC_URL))
+        .option("user",ConfigurationManager.config.getString(Constants.JDBC_USER))
+        .option("password", ConfigurationManager.config.getString(Constants.JDBC_PASSWORD))
+        .option("dbtable", "session_extract_0203")
+        .mode(SaveMode.Append)
+        .save()*/
 
     }
-
 
   }
 
@@ -285,13 +315,13 @@ object SessionStat {
         }
         //更新累加器数据
         if (success) {
+          //Session的总数
           sessionAccumulator.add(Constants.SESSION_COUNT)
           val visitLength = StringUtils.getFieldFromConcatString(fullInfo, "\\|", Constants.FIELD_VISIT_LENGTH).toLong
           val stepLength = StringUtils.getFieldFromConcatString(fullInfo, "\\|", Constants.FIELD_STEP_LENGTH).toLong
-          calculateVisitLength(visitLength, sessionAccumulator)
-          calculateStepLength(stepLength, sessionAccumulator)
+          calculateVisitLength(visitLength, sessionAccumulator) //访问时长
+          calculateStepLength(stepLength, sessionAccumulator)//访问步长
         }
-
         success
       }
     }
@@ -328,7 +358,7 @@ object SessionStat {
 
           }
           val clickCategoryId = action.click_category_id
-          if (clickCategoryId != -1L && clickCategories.toString.contains(clickCategoryId)) {
+          if (clickCategoryId != -1L && !clickCategories.toString.contains(clickCategoryId)) {
             clickCategories.append(clickCategoryId + ",")
           }
           stepLength += 1
@@ -347,6 +377,7 @@ object SessionStat {
         (userId, aggInfo)
       }
     }
+
 
     val sql = "select * from user_info"
     import sparkSession.implicits._
