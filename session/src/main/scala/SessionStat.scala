@@ -134,6 +134,15 @@ object SessionStat {
       // 广播大变量，提升任务性能
       val dataHourExtractIndexListMapBd = sparkSession.sparkContext.broadcast(dateHourExtractIndexListMap)
 
+      val dateHour2GroupRDD: RDD[(String, Iterable[String])] = dateHour2FullInfoRDD.groupByKey
+      dateHour2GroupRDD.flatMap{
+        case (dateHour,iterableFullInfo) =>
+          val date = dateHour.split("_")(0)
+          val hour = dateHour.split("_")(1)
+          dataHourExtractIndexListMapBd.
+      }
+
+
     }
 
 
