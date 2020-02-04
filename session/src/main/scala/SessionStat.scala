@@ -1,10 +1,10 @@
 import java.util.{Date, Random, UUID}
 
-import net.sf.json.JSONObject
 import commons.conf.ConfigurationManager
 import commons.constant.Constants
 import commons.model.{UserInfo, UserVisitAction}
 import commons.utils._
+import net.sf.json.JSONObject
 import org.apache.spark.SparkConf
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{SaveMode, SparkSession}
@@ -49,6 +49,140 @@ object SessionStat {
     sessionRandomExtract(sparkSession, taskUUID, sessionId2FilterRDD)
     //    randomExtract.foreach(println)
 
+    //按照点击数量、下单数量、支付数量的次序进行排序，获取TopN
+
+    // 获取所有符合过滤条件的action数据
+    // sessionId2FilterRDD : RDD[(sessionId, FullInfo)]  符合过滤条件的
+    val sessionId2FilterActionRDD: RDD[(String, UserVisitAction)] = sessionId2ActionRDD.join(sessionId2FilterRDD).map {
+      case (sessionId, (action, fullInfo)) => {
+        (sessionId, action)
+      }
+    }
+
+    top10PopularCategories(sparkSession, taskUUID, sessionId2FilterActionRDD)
+
+  }
+
+  def getPayCount(sessionId2FilterActionRDD: RDD[(String, UserVisitAction)]) = {
+    val payFilterRDD: RDD[(String, UserVisitAction)] = sessionId2FilterActionRDD.filter(item => item._2.pay_category_ids != null)
+    val payNumRDD: RDD[(Long, Long)] = payFilterRDD.flatMap {
+      case (sid, action) =>
+        action.pay_category_ids.split(",").map(x => (x.toLong, 1L))
+    }
+    payNumRDD.reduceByKey(_ + _)
+
+
+  }
+
+  def getOrderCount(sessionId2FilterActionRDD: RDD[(String, UserVisitAction)]) = {
+    val orderFilterRDD: RDD[(String, UserVisitAction)] = sessionId2FilterActionRDD.filter(item => item._2.order_category_ids != null)
+    val orderNumRDD: RDD[(Long, Long)] = orderFilterRDD.flatMap { // 看看map和flatMap的区别
+      case (sid, action) =>
+        action.order_category_ids.split(",").map(item => (item.toLong, 1L))
+    }
+    orderNumRDD.reduceByKey(_ + _)
+  }
+
+  def getClickCount(sessionId2FilterActionRDD: RDD[(String, UserVisitAction)]) = {
+    val clickFilterRDD: RDD[(String, UserVisitAction)] = sessionId2FilterActionRDD.filter(item => item._2.click_category_id != -1L)
+    val clickNumRDD: RDD[(Long, Long)] = clickFilterRDD.map {
+      case (sid, action) => (action.click_category_id, 1L)
+    }
+    clickNumRDD.reduceByKey(_ + _)
+
+  }
+
+
+  def getFullCount(cid2CidRDD: RDD[(Long, Long)],
+                   cid2ClickCountRDD: RDD[(Long, Long)],
+                   cid2OrderCountRDD: RDD[(Long, Long)],
+                   cid2PayCountRDD: RDD[(Long, Long)]) = {
+    val cid2ClickInfoRDD = cid2CidRDD.leftOuterJoin(cid2ClickCountRDD).map {
+      case (cid, (categoryId, option)) =>
+
+        val clickCount = if (option.isDefined) option.get else 0
+        val aggInfo = Constants.FIELD_CATEGORY_ID + "=" + cid + "|" +
+          Constants.FIELD_CLICK_COUNT + "=" + clickCount
+        (cid, aggInfo)
+    }
+    val cid2OrderInfoRDD = cid2ClickInfoRDD.leftOuterJoin(cid2OrderCountRDD).map {
+      case (cid, (clickInfo, option)) =>
+        val orderCount = if (option.isDefined) option.get else 0
+        val aggrInfo = clickInfo + "|" + Constants.FIELD_ORDER_COUNT + "=" +
+          orderCount
+        (cid, aggrInfo)
+    }
+    val cid2PayInfoRDD = cid2OrderInfoRDD.leftOuterJoin(cid2PayCountRDD).map {
+      case (cid, (orderInfo, option)) =>
+        val payCount = if (option.isDefined) option.get else 0
+        val aggrInfo = orderInfo + "|" + Constants.FIELD_PAY_COUNT + "=" +
+          payCount
+        (cid, aggrInfo)
+    }
+    cid2PayInfoRDD
+
+  }
+
+  def top10PopularCategories(sparkSession: SparkSession,
+                             taskUUID: String,
+                             sessionId2FilterActionRDD: RDD[(String, UserVisitAction)]) = {
+
+    // 第一步：获取所有发生过点击、下单、付款的品类
+    var cid2CidRDD: RDD[(Long, Long)] = sessionId2FilterActionRDD.flatMap {
+      case (sid, action) => {
+        val categoryBuffer: ArrayBuffer[(Long, Long)] = new ArrayBuffer[(Long, Long)]()
+        if (action.click_category_id != -1) {
+          categoryBuffer += ((action.click_category_id, action.click_category_id))
+        } else if (action.order_category_ids != null) {
+          for (orderCid <- action.order_category_ids)
+            categoryBuffer += ((orderCid.toLong, orderCid.toLong))
+
+        } else if (action.pay_category_ids != null) {
+          for (payCid <- action.pay_category_ids)
+            categoryBuffer += ((payCid.toLong, payCid.toLong))
+        }
+        categoryBuffer
+      }
+    }
+    cid2CidRDD = cid2CidRDD.distinct()
+
+    // 第二步：统计品类的点击次数、下单次数、付款次数
+    val cid2ClickCountRDD: RDD[(Long, Long)] = getClickCount(sessionId2FilterActionRDD)
+    val cid2OrderCountRDD = getOrderCount(sessionId2FilterActionRDD)
+    val cid2PayCountRDD = getPayCount(sessionId2FilterActionRDD)
+    //    (78,categoryid=78|clickCount=51|orderCount=61|payCount=70)
+    val cid2FullCountRDD: RDD[(Long, String)] = getFullCount(cid2CidRDD, cid2ClickCountRDD, cid2OrderCountRDD, cid2PayCountRDD)
+    // 实现自定义二次排序key
+    val sortKey2FullCountRDD: RDD[(SortKey, String)] = cid2FullCountRDD.map {
+      case (cid, countInfo) =>
+        val clickCount = StringUtils.getFieldFromConcatString(countInfo, "\\|", Constants.FIELD_CLICK_COUNT).toLong
+        val orderCount = StringUtils.getFieldFromConcatString(countInfo, "\\|", Constants.FIELD_ORDER_COUNT).toLong
+        val payCount = StringUtils.getFieldFromConcatString(countInfo, "\\|", Constants.FIELD_PAY_COUNT).toLong.toLong
+        val sortKey = SortKey(clickCount, orderCount, payCount)
+        (sortKey, countInfo)
+    }
+    //(SortKey(88,66,61),categoryid=31|clickCount=88|orderCount=66|payCount=61)
+    val top10CategoryArray: Array[(SortKey, String)] = sortKey2FullCountRDD.sortByKey(false).take(10)
+    //构成rdd，转化为DF，导入数据库
+    val top10CategoryRDD = sparkSession.sparkContext.makeRDD(top10CategoryArray).map {
+      case (sortKey, countInfo) =>
+        val cid = StringUtils.getFieldFromConcatString(countInfo, "\\|", Constants.FIELD_CATEGORY_ID).toLong
+        val clickCount = sortKey.clickCount
+        val orderCount = sortKey.orderCount
+        val payCount = sortKey.payCount
+        Top10Category(taskUUID, cid, clickCount, orderCount, payCount)
+    }
+    import sparkSession.implicits._
+    top10CategoryRDD.toDF().write
+      .format("jdbc")
+      .option("url", ConfigurationManager.config.getString(Constants.JDBC_URL))
+      .option("user", ConfigurationManager.config.getString(Constants.JDBC_USER))
+      .option("password", ConfigurationManager.config.getString(Constants.JDBC_PASSWORD))
+      .option("dbtable", "top10_category_0203")
+      .mode(SaveMode.Append)
+      .save
+
+    top10CategoryArray
 
   }
 
@@ -140,11 +274,11 @@ object SessionStat {
       //   RDD[(dateHour, Iterable[fullInfo])]
       // extractSessionRDD: RDD[SessionRandomExtract]
       // 返回的是一个ArrayBuffer对象
-      val extractSessionRDD =  dateHour2GroupRDD.flatMap {
+      val extractSessionRDD = dateHour2GroupRDD.flatMap {
         case (dateHour, iterableFullInfo) =>
           val date = dateHour.split("_")(0)
           val hour = dateHour.split("_")(1)
-          val extractList:ListBuffer[Int] = dataHourExtractIndexListMapBd.value.get(date).get(hour)
+          val extractList: ListBuffer[Int] = dataHourExtractIndexListMapBd.value.get(date).get(hour)
           // 定义一个容器
           val extractSessionArrayBuffer = new ArrayBuffer[SessionRandomExtract]()
           var index = 0
@@ -162,17 +296,16 @@ object SessionStat {
 
           extractSessionArrayBuffer
       }
-//      extractSessionRDD.foreach(println(_))
-      import sparkSession.implicits._
+      //      extractSessionRDD.foreach(println(_))
       //随机抽取100个session；
-     /* extractSessionRDD.toDF().write
-        .format("jdbc")
-        .option("url", ConfigurationManager.config.getString(Constants.JDBC_URL))
-        .option("user",ConfigurationManager.config.getString(Constants.JDBC_USER))
-        .option("password", ConfigurationManager.config.getString(Constants.JDBC_PASSWORD))
-        .option("dbtable", "session_extract_0203")
-        .mode(SaveMode.Append)
-        .save()*/
+      /* extractSessionRDD.toDF().write
+         .format("jdbc")
+         .option("url", ConfigurationManager.config.getString(Constants.JDBC_URL))
+         .option("user",ConfigurationManager.config.getString(Constants.JDBC_USER))
+         .option("password", ConfigurationManager.config.getString(Constants.JDBC_PASSWORD))
+         .option("dbtable", "session_extract_0203")
+         .mode(SaveMode.Append)
+         .save()*/
 
     }
 
@@ -320,7 +453,7 @@ object SessionStat {
           val visitLength = StringUtils.getFieldFromConcatString(fullInfo, "\\|", Constants.FIELD_VISIT_LENGTH).toLong
           val stepLength = StringUtils.getFieldFromConcatString(fullInfo, "\\|", Constants.FIELD_STEP_LENGTH).toLong
           calculateVisitLength(visitLength, sessionAccumulator) //访问时长
-          calculateStepLength(stepLength, sessionAccumulator)//访问步长
+          calculateStepLength(stepLength, sessionAccumulator) //访问步长
         }
         success
       }
